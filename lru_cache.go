@@ -4,68 +4,102 @@
 		"encoding/json"
 		"fmt"
 		"github.com/gorilla/mux"
-		"github.com/loganrk/go-heap-cache"
 		"github.com/rs/cors"
 		"sync"
 		"net/http"
+		"time"
 	)
 
-	type LRUCache struct {
-		cache cache.Cache
-		mutex sync.Mutex
+type Cache struct {
+	Key        string    `json:"key"`
+	Value      string    `json:"value"`
+	Expiration time.Time `json:"expiration"`
+}
+
+type LRUCache struct {
+	cache     map[string]*Cache
+	order     []*Cache
+	maxSize   int
+	mutex     sync.Mutex
+}
+
+
+func NewLRUCache(maxSize int) *LRUCache {
+	return &LRUCache{
+		cache:   make(map[string]*Cache),
+		order:   make([]*Cache, 0),
+		maxSize: maxSize,
+		mutex:   sync.Mutex{},
 	}
+}
 
-	func NewLRUCache() *LRUCache {
-		config := cache.Config{
-			Capacity: 100,               
-			Expire: 5, // 5 sec               
-			EvictionPolicy: cache.EVICTION_POLICY_LRU, 
-		}
+func (lru *LRUCache) Get(key string) (string, bool) {
+	lru.mutex.Lock()
+	defer lru.mutex.Unlock()
 
-		cacheInstance := cache.New(&config)
-		return &LRUCache{cache: cacheInstance}
-	}
-
-	func (lru *LRUCache) Get(key string) (string, bool) {
-		lru.mutex.Lock()
-		defer lru.mutex.Unlock()
-
-		data, err := lru.cache.Get(key)
-		if err != nil {
-			return "", false
-		}
-
-		if value, ok := data.(string); ok {
-			return value, true
-		}
-	
+	item, exists := lru.cache[key]
+	if !exists || item.Expiration.Before(time.Now()) {
 		return "", false
 	}
 
-	func (lru *LRUCache) Set(key, value string) {
-		lru.mutex.Lock()
-		defer lru.mutex.Unlock()
-		
-		lru.cache.Set(key, value)
+	lru.updateOrder(item)
+	return item.Value, true
+}
+
+func (lru *LRUCache) Set(key, value string, expiration time.Time) {
+	lru.mutex.Lock()
+	defer lru.mutex.Unlock()
+
+	if len(lru.cache) >= lru.maxSize {
+		lru.deleteLeastRU()
 	}
 
+	item := &Cache{
+		Key:        key,
+		Value:      value,
+		Expiration: expiration,
+	}
+
+	lru.cache[key] = item
+	lru.order = append(lru.order, item)
+}
+
+func (lru *LRUCache) deleteLeastRU() {
+	if len(lru.order) == 0 {
+		return
+	}
+
+	item := lru.order[0]
+	delete(lru.cache, item.Key)
+	lru.order = lru.order[1:]
+}
+
+func (lru *LRUCache) updateOrder(item *Cache) {
+	for i, cachedItem := range lru.order {
+		if cachedItem == item {
+			// Move item to the front of the order
+			lru.order = append(lru.order[:i], lru.order[i+1:]...)
+			lru.order = append([]*Cache{item}, lru.order...)
+			break
+		}
+	}
+}
 
 	func main() {
-		mycache := NewLRUCache()
+		cache := NewLRUCache(1024)
 
 		r := mux.NewRouter()
 
 		r.HandleFunc("/get/{key}", func(w http.ResponseWriter, r *http.Request) {
 			params := mux.Vars(r)
 			key := params["key"]
-			
-			value, exists := mycache.Get(key)
+		
+			value, exists := cache.Get(key)
 			if !exists {
 				http.Error(w, "Key not found in cache", http.StatusNotFound)
 				return
 			}
-			
-			fmt.Println("Key: "+ key + ", Value: "+value)
+		
 			response := map[string]string{"key": key, "value": value}
 			json.NewEncoder(w).Encode(response)
 		}).Methods("GET")
@@ -75,17 +109,15 @@
 				Key   string `json:"key"`
 				Value string `json:"value"`
 			}
-
-			
+		
 			err := json.NewDecoder(r.Body).Decode(&cacheData)
 			if err != nil {
 				http.Error(w, "Invalid request body", http.StatusBadRequest)
 				return
 			}
-			
-			mycache.Set(cacheData.Key, cacheData.Value)
-			
-			fmt.Println("Value set in cache")
+		
+			cache.Set(cacheData.Key, cacheData.Value, time.Now().Add(5*time.Second))
+		
 			response := map[string]string{"message": "Value set in cache"}
 			json.NewEncoder(w).Encode(response)
 		}).Methods("POST")
